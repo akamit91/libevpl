@@ -29,6 +29,7 @@
 #endif /* ifdef _WIN32 */
 
 #include "evpl/evpl.h"
+#include "evpl/evpl_config.h"
 #include "evpl/evpl_rpc2.h"
 
 #include "core/test_log.h"
@@ -175,6 +176,28 @@ greet(
     evpl_test_abort_if(ctx.status != 0, "call %u failed: %d", id, ctx.status);
 } /* greet */
 
+/* Value of one traffic series in the process metrics, 0 if absent. */
+static uint64_t
+traffic(
+    const char *metric,
+    const char *direction,
+    const char *thread)
+{
+    static char scrape[1 << 20];
+    char        key[160];
+    const char *p;
+
+    if (evpl_metrics_scrape(scrape, sizeof(scrape)) <= 0) {
+        return 0;
+    }
+
+    snprintf(key, sizeof(key), "%s{direction=\"%s\",thread=\"%s\"} ", metric, direction, thread);
+
+    p = strstr(scrape, key);
+
+    return p ? strtoull(p + strlen(key), NULL, 10) : 0;
+} /* traffic */
+
 static void
 check_counters(
     const char                             *when,
@@ -241,7 +264,12 @@ main(
         } /* switch */
     }
 
-    evpl = evpl_create(NULL);
+    {
+        struct evpl_thread_config *tcfg = evpl_thread_config_init();
+
+        evpl_thread_config_set_name(tcfg, "srvinspect");
+        evpl = evpl_create(tcfg);
+    }
 
     HELLO_V1_init(&prog);
     prog.recv_call_GREET = server_recv_greet;
@@ -309,6 +337,32 @@ main(
     evpl_test_abort_if(c.info[0].bind.serial == c.info[1].bind.serial &&
                        c.info[0].bind.remote.port == c.info[1].bind.remote.port,
                        "two connections share one identity");
+
+    /* The thread's traffic counters see at least what the visited server
+     * connections counted: they also carry the client side of both. */
+    {
+        uint64_t                    rx_msgs = 0, tx_msgs = 0, rx_bytes = 0, tx_bytes = 0;
+        struct evpl_thread_identity id;
+
+        for (i = 0; i < 2; i++) {
+            rx_msgs  += c.info[i].rx_msgs;
+            tx_msgs  += c.info[i].tx_msgs;
+            rx_bytes += c.info[i].rx_bytes;
+            tx_bytes += c.info[i].tx_bytes;
+        }
+
+        evpl_thread_get_identity(evpl, &id);
+
+        evpl_test_abort_if(traffic("evpl_rpc2_messages", "rx", id.name) < rx_msgs,
+                           "thread rx message counter below its connections");
+        evpl_test_abort_if(traffic("evpl_rpc2_messages", "tx", id.name) < tx_msgs,
+                           "thread tx message counter below its connections");
+        evpl_test_abort_if(traffic("evpl_rpc2_bytes", "rx", id.name) < rx_bytes,
+                           "thread rx byte counter below its connections");
+        evpl_test_abort_if(traffic("evpl_rpc2_bytes", "tx", id.name) < tx_bytes,
+                           "thread tx byte counter below its connections");
+        evpl_test_abort_if(!rx_msgs || !rx_bytes, "connections counted nothing");
+    }
 
     tagged = 0;
     for (i = 0; i < 2; i++) {
